@@ -1,0 +1,56 @@
+# Example kbwall configuration
+# Copy to ~/.config/kbwall/kb.toml and customize your local directories.
+
+[engine]
+# Loopback-only by default (127.0.0.1 / localhost / [::1]).
+url = "http://127.0.0.1:9200"
+xerj_bin = ""
+
+[security]
+# Built-in secret exclusions (.env, *.key, *.pem, *secret*, *credential*, *token*.json, *.sqlite*)
+# are ALWAYS enforced even if omitted here.
+exclude = [
+  "archive/**",
+  "private/**"
+]
+allow_passage_read = true
+max_read_lines = 80
+
+[query]
+default_scope = "docs"          # docs | code | all
+enable_cjk_enhance = true       # Auto-activates only on CJK/mixed queries
+enable_fuzzy_fallback = true    # Auto-retries with fuzziness=AUTO on 0-hit queries
+vocab_file = "~/.config/kbwall/vocab.json"
+synonyms = [
+  ["revenue", "营业收入", "营收"],
+  ["goodwill impairment", "商誉减值"],
+  ["force majeure", "不可抗力"],
+]
+
+[[groups]]
+key = "notes"
+label = "Notes & Wiki"
+
+[[groups]]
+key = "research"
+label = "Research & PDFs"
+
+[[groups]]
+key = "code"
+label = "Codebases"
+
+[[sources]]
+key = "notes"
+name = "Personal Notes"
+path = "~/Documents/notes"
+prefix = "kb-notes"
+group = "notes"
+default_included = true
+
+[[sources]]
+key = "filings"
+name = "Annual Reports (AKReport)"
+path = "~/Documents/AKReport/output"
+prefix = "kb-filings"
+group = "research"
+default_included = true
