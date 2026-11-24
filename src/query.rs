@@ -440,7 +440,13 @@ pub(crate) fn build_search_body(
         if core_units.is_empty() {
             must_clauses.push(json!({ "multi_match": { "query": query, "fields": code_fields, "lenient": true } }));
         } else {
-            let msm = if core_units.len() <= 2 {
+            let msm = if require_anchors {
+                if core_units.len() <= 2 {
+                    core_units.len()
+                } else {
+                    ((core_units.len() as f64) * 0.6).ceil().max(2.0) as usize
+                }
+            } else if core_units.len() <= 2 {
                 1
             } else {
                 ((core_units.len() as f64) * 0.45).floor().max(1.0) as usize
@@ -872,9 +878,13 @@ pub(crate) fn execute_search(
         mode_used.as_str()
     };
 
+    let code_multi_unit =
+        scope == "code" && (info.unicode_terms.len() + info.bigram_groups.len()) >= 2;
     let mut anchor_relaxed = false;
     let mut fuzzy_used = false;
-    if hits.is_empty() && scope != "code" && has_anchors && !info.bigram_groups.is_empty() {
+    if hits.is_empty()
+        && ((scope != "code" && has_anchors && !info.bigram_groups.is_empty()) || code_multi_unit)
+    {
         anchor_relaxed = true;
         fuzzy_used = has_fuzzy_eligible;
         if let Ok(r2) = run(active_mode, false, has_fuzzy_eligible) {
@@ -1127,6 +1137,25 @@ group = "notes"
         assert!(docs_dsl.to_string().contains("\"md\""));
         assert!(code_dsl.to_string().contains("\"rs\""));
         assert!(code_dsl.to_string().contains("defs^4"));
+
+        // 2-term code query requires both terms strictly before fallback relaxation.
+        let two_info = analyze_query("def sync_target", &cfg);
+        let strict_code =
+            build_search_body("def sync_target", &two_info, 5, "bm25", "code", true, false);
+        let relaxed_code =
+            build_search_body("def sync_target", &two_info, 5, "bm25", "code", false, true);
+        assert_eq!(
+            strict_code
+                .pointer("/query/bool/must/0/bool/minimum_should_match")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            relaxed_code
+                .pointer("/query/bool/must/0/bool/minimum_should_match")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
     }
 
     #[test]
