@@ -28,7 +28,10 @@ fn parse_pairs(bytes: &[u8]) -> Vec<(u32, u32)> {
 fn tables() -> &'static CjkTables {
     static TABLES: OnceLock<CjkTables> = OnceLock::new();
     TABLES.get_or_init(|| CjkTables {
-        syllables: PINYIN_SYLLABLES_RAW.split('\n').collect(),
+        syllables: PINYIN_SYLLABLES_RAW
+            .split('\n')
+            .map(|s| s.trim_end_matches('\r'))
+            .collect(),
         s2t: parse_pairs(CJK_S2T_BYTES),
         t2s: parse_pairs(CJK_T2S_BYTES),
     })

@@ -622,9 +622,9 @@ impl KbConfig {
             ))]
             const FLAGS: i32 = 0x0100 | 0x0004; // O_NOFOLLOW | O_NONBLOCK on BSD/macOS
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
-            const FLAGS: i32 = 0o0400_000 | 0o0004_000; // O_NOFOLLOW | O_NONBLOCK on Linux x86/x86_64
+            const FLAGS: i32 = 0o400_000 | 0o004_000; // O_NOFOLLOW | O_NONBLOCK on Linux x86/x86_64
             #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
-            const FLAGS: i32 = 0o0100_000 | 0o0004_000; // O_NOFOLLOW | O_NONBLOCK on Linux arm/aarch64
+            const FLAGS: i32 = 0o100_000 | 0o004_000; // O_NOFOLLOW | O_NONBLOCK on Linux arm/aarch64
             #[cfg(not(any(
                 target_os = "macos",
                 target_os = "freebsd",

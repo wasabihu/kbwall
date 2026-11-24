@@ -1,0 +1,2 @@
+*.bin binary
+src/data/pinyin_syllables.txt text eol=lf
