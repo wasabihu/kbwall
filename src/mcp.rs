@@ -683,7 +683,8 @@ group = "notes"
         let expected_cite =
             format!("cite: xerj://kb-notes-docs/doc-42#b={passage_start}-{passage_end}&f=body");
         assert!(text.contains(&expected_cite), "missing cite in:\n{text}");
-        assert!(text.contains("path: /tmp/rust.md"));
+        let expected_path = format!("path: {}", Path::new("/tmp").join("rust.md").display());
+        assert!(text.contains(&expected_path), "missing path in:\n{text}");
         assert!(text.contains("snippet: Zero unsafe and zero unwrap in production paths."));
         assert!(!text.contains("127.0.0.1"));
     }

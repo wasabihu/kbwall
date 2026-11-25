@@ -6,7 +6,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/wasabihu/kbwall/main/install.sh | sh
 #
 # Optional environment variables:
-#   KBWALL_VERSION=v0.1.0        Pin a specific release tag (default: latest)
+#   KBWALL_VERSION=v0.2.0        Pin a specific release tag (default: latest)
 #   KBWALL_INSTALL_DIR=~/.local/bin
 
 set -eu
