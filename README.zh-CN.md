@@ -4,6 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Zero Unsafe](https://img.shields.io/badge/unsafe-forbid-22c55e.svg)](Cargo.toml)
 [![Zero TLS / Air-Gapped](https://img.shields.io/badge/network-loopback%20only-0ea5e9.svg)](SECURITY.md)
+[![wasabihu/kbwall MCP server](https://glama.ai/mcp/servers/wasabihu/kbwall/badges/score.svg)](https://glama.ai/mcp/servers/wasabihu/kbwall)
 
 [English](README.md) · **简体中文**
 
