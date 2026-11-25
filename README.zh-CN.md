@@ -69,19 +69,36 @@ codex mcp add kbwall -- ~/.local/bin/kbwall mcp
 
 ## 暴露的 3 个纯只读 MCP 工具
 
-1. **`kb_search`**：跨配置知识库检索，支持 `query`、`scope`（`docs` / `code` / `all`）、`group`、`target`、`limit`（`1..=15`）与 `mode`（`bm25` / `hybrid`，无向量时自动回退 BM25），返回精确路径、起止行号、PDF 页码（如 `p.211/257`）与摘录。
+1. **`kb_search`**：跨配置知识库检索，支持 `query`、`scope`（`docs` / `code` / `all`）、`group`、`target`、`limit`（`1..=15`）与 `mode`（`bm25` / `hybrid`，所有过滤条件均下推至 `hybrid` 各子分支，无向量时自动回退 BM25），返回精确路径、起止行号、PDF 页码（如 `p.211/257`）、标准 `xerj://` 证据句柄（`cite`）与摘录。
 2. **`kb_status`**：查看本机引擎在线状态、总索引片段数、领域分组及各分库路径。
 3. **`kb_read`**（可通过 `security.allow_passage_read = false` 关闭）：按白名单只读查看命中文件的上下文片段（默认单次最多 80 行），强制拦截目录外路径、符号链接逃逸、二进制文件与敏感密钥文件。
 
 ---
 
-## 生态联动（最小权限本地 AI 基础设施栈）
+## 可核验 `xerj://` 证据句柄（零幻觉引用闭环）
 
-- **[`xerj-org/xerj`](https://github.com/xerj-org/xerj)**：底层单二进制 Rust 搜索引擎，负责全格式索引与 BM25/混合检索。
-- **[`wasabihu/sessfork`](https://github.com/wasabihu/sessfork)**：姊妹篇零 Tokio Rust MCP（`sessfork-mcp`），负责安全无抢焦点访问外部已登录网页。
-- **[`wasabihu/vericorpus`](https://github.com/wasabihu/vericorpus)**：面向 XERJ/ES 的合规多语种法条/财报/临床语料与检索基准。
-- **[`wasabihu/AKReport`](https://github.com/wasabihu/AKReport)**：批量下载 A 股/港股历年年报 PDF，配合 `kbwall` 5 行配置秒变 100% 纯本地私有 AI 财报投研库。
-- **[`wasabihu/claimcite`](https://github.com/wasabihu/claimcite)**：逐条核查 AI 写作里的公开学术引用是否真实且与原文一致。
+每条合规的 `kb_search` 命中结果均会输出与 [`wasabihu/claimcite`](https://github.com/wasabihu/claimcite) 逐字节对齐的无宿主证据句柄：
+
+```text
+xerj://<percent_encoded_index>/<percent_encoded_doc_id>#b=<byte_start>-<byte_end>&f=<field>
+```
+
+- **不含 `host:port`**：引用天然跨机可迁移，不在文档与报告中暴露内网拓扑。
+- **严格 UTF-8 字节边界**：优先复用 XERJ 核验过的 `_passage` 字节偏移，混合检索或无 `_passage` 命中时自动对齐到合法 UTF-8 字符边界。
+- **本地闭环验真**：在 Markdown 中引用原文与 `cite: xerj://...`，运行 `claimcite check --xerj-url http://127.0.0.1:9200` 即可对每一处引文完成字节级核验。
+
+---
+
+## Verified XERJ Open Ecosystem（已验证开源生态链）
+
+| 环节 | 项目 / 模型 | 职责 |
+| :--- | :--- | :--- |
+| **1. 采集入库** | **[`wasabihu/sessfork`](https://github.com/wasabihu/sessfork)** | 零 Tokio Rust MCP（`sessfork-mcp`）与免抢焦点已登录网页安全采集入库。 |
+| **1b. 财报源** | **[`wasabihu/AKReport`](https://github.com/wasabihu/AKReport)** | 批量下载 A 股/港股历年年报 PDF，直接接入 `kbwall` 私有财报库。 |
+| **2. 检索引擎** | **[`xerj-org/xerj`](https://github.com/xerj-org/xerj)** | 单二进制 Rust 搜索引擎，承担全格式索引、BM25、HNSW/kNN 与混合检索。 |
+| **2b. 开源模型（HF）** | **[`wasabihu/xerj-bilingual-fin-law-384`](https://huggingface.co/wasabihu/xerj-bilingual-fin-law-384)**（MIT）<br>**[`wasabihu/VeriCorpus-Reranker-0.6B`](https://huggingface.co/wasabihu/VeriCorpus-Reranker-0.6B)**（Apache-2.0） | 中英双语金融/法律 384 维嵌入模型与 0.6B 交叉编码器精排模型。 |
+| **3. 只读防火墙** | **`wasabihu/kbwall`** *（本仓）* | ~1 MB 架构级断网只读 Rust MCP 防火墙，执行密钥隔离、混合过滤下推并输出 `xerj://` 证据句柄。 |
+| **4. 验真与基准** | **[`wasabihu/claimcite`](https://github.com/wasabihu/claimcite)**<br>**[`wasabihu/vericorpus`](https://github.com/wasabihu/vericorpus)** | 零依赖 `xerj://` 字节跨度引文核查器 + 合规法条/财报/临床语料与中文检索基准。 |
 
 ---
 

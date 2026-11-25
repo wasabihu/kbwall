@@ -69,9 +69,23 @@ codex mcp add kbwall -- ~/.local/bin/kbwall mcp
 
 ## Exposed MCP Tools (Strictly Read-Only)
 
-1. **`kb_search`**: Search across configured sources with `query`, `scope` (`docs` / `code` / `all`), `group`, `target`, `limit` (`1..=15`), and `mode` (`bm25` / `hybrid` with automatic BM25 fallback). Returns exact file paths, line ranges, PDF page numbers (`p.211/257`), and snippets.
+1. **`kb_search`**: Search across configured sources with `query`, `scope` (`docs` / `code` / `all`), `group`, `target`, `limit` (`1..=15`), and `mode` (`bm25` / `hybrid` with filter pushdown into every sub-query leg and automatic BM25 fallback). Returns exact file paths, line ranges, PDF page numbers (`p.211/257`), canonical `xerj://` evidence handles (`cite`), and snippets.
 2. **`kb_status`**: Inspect local engine health, total indexed passages, domain groups, and configured source paths.
 3. **`kb_read`** *(disable via `security.allow_passage_read = false`)*: Read a bounded slice of lines (default max 80) from a whitelisted file inside configured `[[sources]]` directories. Canonicalizes paths to block `..` traversal, symlink escapes, binary files, and built-in/custom secret exclusion globs.
+
+---
+
+## Verifiable `xerj://` Evidence Handles
+
+Every eligible `kb_search` hit (in MCP output, `kbwall search`, and `kbwall search --json`) emits a canonical, host-free evidence handle matching the shared [`wasabihu/claimcite`](https://github.com/wasabihu/claimcite) span protocol byte-for-byte:
+
+```text
+xerj://<percent_encoded_index>/<percent_encoded_doc_id>#b=<byte_start>-<byte_end>&f=<field>
+```
+
+- **No `host:port` in document URIs**: citations stay portable across machines and never leak internal network topology into reports or manuscripts.
+- **Strict UTF-8 byte boundaries**: `#b=<byte_start>-<byte_end>` always snaps to verified UTF-8 character boundaries in `_source.<field>` (preferring XERJ's verified `_passage` byte offsets when present and falling back to exact/longest-chunk span location for `hybrid` or non-`_passage` hits).
+- **Zero-hallucination round-trip**: copy any verbatim quote alongside its `cite: xerj://...` handle into Markdown and run `claimcite check --xerj-url http://127.0.0.1:9200` to verify every quote byte-for-byte against your local XERJ node.
 
 ---
 
@@ -90,15 +104,18 @@ kbwall setup [--name kbwall] [--mcp-file <path>]
 
 ---
 
-## Part of the Least-Privilege Local AI Agent Stack
+## Verified XERJ Open Ecosystem
 
-`kbwall` pairs cleanly with companion open-source projects:
+`kbwall` sits at the read-only retrieval firewall layer of an end-to-end, local-first open stack:
 
-- **[`xerj-org/xerj`](https://github.com/xerj-org/xerj)** — High-speed single-binary Rust search engine powering indexing and BM25/hybrid retrieval underneath `kbwall`.
-- **[`wasabihu/sessfork`](https://github.com/wasabihu/sessfork)** — Sister zero-Tokio Rust MCP (`sessfork-mcp`) for least-privilege, zero-focus-theft authenticated web browsing via Moli/Chrome.
-- **[`wasabihu/vericorpus`](https://github.com/wasabihu/vericorpus)** — Audit-grade statutory, financial, and clinical corpora & CJK retrieval benchmarks for XERJ/ES engines.
-- **[`wasabihu/AKReport`](https://github.com/wasabihu/AKReport)** — Batch-download A-share/HKEX annual report PDFs straight into a `kbwall` research source for 100% private local AI financial research.
-- **[`wasabihu/claimcite`](https://github.com/wasabihu/claimcite)** — Verify that every citation and quote in AI-assisted writing matches real published literature.
+| Stage | Project / Model | Role |
+| :--- | :--- | :--- |
+| **1. Ingest** | **[`wasabihu/sessfork`](https://github.com/wasabihu/sessfork)** | Zero-Tokio Rust MCP (`sessfork-mcp`) & authenticated web ingestion into local XERJ without foreground focus theft. |
+| **1b. Filings** | **[`wasabihu/AKReport`](https://github.com/wasabihu/AKReport)** | Batch-download A-share/HKEX annual report PDFs directly into a private local `kbwall` source. |
+| **2. Search Engine** | **[`xerj-org/xerj`](https://github.com/xerj-org/xerj)** | Single-binary Rust search engine powering indexing, BM25, HNSW/kNN, and hybrid fusion underneath `kbwall`. |
+| **2b. Open Models (HF)** | **[`wasabihu/xerj-bilingual-fin-law-384`](https://huggingface.co/wasabihu/xerj-bilingual-fin-law-384)** (MIT)<br>**[`wasabihu/VeriCorpus-Reranker-0.6B`](https://huggingface.co/wasabihu/VeriCorpus-Reranker-0.6B)** (Apache-2.0) | Bilingual finance/law 384-d embeddings and clean-room 0.6B cross-encoder reranker for local neural/hybrid retrieval. |
+| **3. Read-Only Firewall** | **`wasabihu/kbwall`** *(this repo)* | ~1 MB air-gapped, read-only Rust MCP firewall enforcing secret confinement, hybrid filter pushdown, and canonical `xerj://` evidence handles. |
+| **4. Verification & Eval** | **[`wasabihu/claimcite`](https://github.com/wasabihu/claimcite)**<br>**[`wasabihu/vericorpus`](https://github.com/wasabihu/vericorpus)** | Zero-dependency citation & `xerj://` UTF-8 byte-span verifier + audit-grade statutory/financial/clinical corpora & CJK retrieval benchmarks. |
 
 ---
 

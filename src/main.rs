@@ -153,6 +153,8 @@ fn cmd_search(cfg: &KbConfig, args: &[String]) -> i32 {
                     .map(|h| {
                         json!({
                             "index": h.index,
+                            "doc_id": h.doc_id,
+                            "cite": h.cite,
                             "target": h.target_key,
                             "target_name": h.target_name,
                             "group": h.group,

@@ -67,6 +67,8 @@ pub(crate) struct QueryAnalysis {
 #[derive(Debug, Clone)]
 pub(crate) struct SearchHit {
     pub(crate) index: String,
+    pub(crate) doc_id: String,
+    pub(crate) cite: Option<String>,
     pub(crate) target_key: String,
     pub(crate) target_name: String,
     pub(crate) group: String,
@@ -587,11 +589,24 @@ pub(crate) fn build_search_body(
     };
 
     let dsl_query = if mode == "hybrid" {
+        // XERJ requires `hybrid` to sit at the top-level query (wrapping `hybrid` inside
+        // an outer `bool { must: hybrid, filter }` silently drops hits and ignores `post_filter`).
+        // Push the exact same scope and `bak-` constraints down into EVERY sub-query leg.
         json!({
             "hybrid": {
                 "queries": [
                     { "query": { "bool": bool_clause }, "weight": 1.0 },
-                    { "query": { "semantic": { "field": "body", "query": query, "k": (limit * 2).max(10) } }, "weight": 0.4 }
+                    {
+                        "query": {
+                            "semantic": {
+                                "field": "body",
+                                "query": query,
+                                "k": (limit * 2).max(10),
+                                "filter": build_scope_filter_clause(scope)
+                            }
+                        },
+                        "weight": 0.4
+                    }
                 ]
             }
         })
@@ -599,7 +614,7 @@ pub(crate) fn build_search_body(
         json!({ "bool": bool_clause })
     };
 
-    json!({
+    let mut body = json!({
         "query": dsl_query,
         "size": limit,
         "_source": [
@@ -611,10 +626,44 @@ pub(crate) fn build_search_body(
             "line",
             "path",
             "page",
-            "pdf_pages_total"
-        ],
-        "fields": ["_passage"]
-    })
+            "pdf_pages_total",
+            "body",
+            "text",
+            "content",
+            "code"
+        ]
+    });
+    // XERJ rejects `fields: ["_passage"]` on `hybrid` fusion queries (HTTP 400); request
+    // `_passage` only on non-hybrid searches and extract spans from `_source` for hybrid.
+    if mode != "hybrid" {
+        if let Some(map) = body.as_object_mut() {
+            map.insert("fields".to_string(), json!(["_passage"]));
+        }
+    }
+    body
+}
+
+fn build_scope_filter_clause(scope: &str) -> Value {
+    let must_not = json!([{ "prefix": { "ax_format": "bak-" } }]);
+    match scope {
+        "code" => json!({
+            "bool": {
+                "filter": [{ "terms": { "ax_format": CODE_FORMATS } }],
+                "must_not": must_not
+            }
+        }),
+        "docs" => json!({
+            "bool": {
+                "filter": [{ "terms": { "ax_format": DOC_FORMATS } }],
+                "must_not": must_not
+            }
+        }),
+        _ => json!({
+            "bool": {
+                "must_not": must_not
+            }
+        }),
+    }
 }
 
 pub(crate) fn resolve_prefixes<'a>(
@@ -651,6 +700,284 @@ pub(crate) fn resolve_prefixes<'a>(
         .collect())
 }
 
+const XERJ_URI_FALLBACK_BYTES: usize = 240;
+const XERJ_URI_MIN_CHUNK_BYTES: usize = 12;
+
+fn hex_upper(nibble: u8) -> char {
+    match nibble & 0x0f {
+        n @ 0..=9 => char::from(b'0' + n),
+        n => char::from(b'A' + (n - 10)),
+    }
+}
+
+/// Percent-encode a URI path/query component per RFC 3986 (leaving only
+/// unreserved `A-Z a-z 0-9 - . _ ~` unencoded, using uppercase hex).
+pub(crate) fn percent_encode_rfc3986(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for &b in raw.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push('%');
+            out.push(hex_upper(b >> 4));
+            out.push(hex_upper(b & 0x0f));
+        }
+    }
+    out
+}
+
+fn is_valid_xerj_index(index: &str) -> bool {
+    !index.is_empty()
+        && !index.starts_with('_')
+        && !index.contains("..")
+        && !index.chars().any(|c| {
+            matches!(c, '/' | '\\' | '*' | '?' | '#' | ':') || c.is_whitespace() || c.is_control()
+        })
+}
+
+fn is_valid_xerj_doc_id(doc_id: &str) -> bool {
+    !doc_id.is_empty() && !doc_id.chars().any(char::is_control)
+}
+
+fn is_valid_xerj_field(field: &str) -> bool {
+    !field.is_empty()
+        && !field.contains("..")
+        && !field.chars().any(|c| {
+            matches!(c, '/' | '\\' | '*' | '?' | '#' | ':' | '&' | '=')
+                || c.is_whitespace()
+                || c.is_control()
+        })
+}
+
+/// Snap `max_bytes` down to a valid UTF-8 character boundary in `s` (MSRV 1.88 compatible).
+fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
+    let mut end = max_bytes.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+fn strip_edge_ellipsis(mut s: &str) -> &str {
+    loop {
+        let next = s
+            .trim()
+            .trim_start_matches("...")
+            .trim_start_matches('…')
+            .trim_end_matches("...")
+            .trim_end_matches('…')
+            .trim();
+        if next.len() == s.len() {
+            return next;
+        }
+        s = next;
+    }
+}
+
+/// Locate a multi-token `needle` inside `full_text` where each whitespace gap in
+/// `needle` matches one or more whitespace characters in `full_text`, returning exact
+/// UTF-8 byte offsets `(byte_start, byte_end)` on guaranteed char boundaries.
+fn find_span_ws_flexible(full_text: &str, needle: &str) -> Option<(usize, usize)> {
+    let tokens: Vec<&str> = needle.split_whitespace().collect();
+    if tokens.len() < 2 {
+        return None;
+    }
+    let first = *tokens.first()?;
+    let tail = tokens.get(1..).unwrap_or(&[]);
+    let mut search_from = 0usize;
+    while let Some(haystack) = full_text.get(search_from..) {
+        let Some(rel_start) = haystack.find(first) else {
+            break;
+        };
+        let start = search_from + rel_start;
+        let mut cursor = start + first.len();
+        let mut matched_all = true;
+        for &tok in tail {
+            let Some(rest) = full_text.get(cursor..) else {
+                matched_all = false;
+                break;
+            };
+            let ws_bytes: usize = rest
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .map(char::len_utf8)
+                .sum();
+            if ws_bytes == 0 {
+                matched_all = false;
+                break;
+            }
+            let after_ws = cursor + ws_bytes;
+            if full_text
+                .get(after_ws..)
+                .is_some_and(|s| s.starts_with(tok))
+            {
+                cursor = after_ws + tok.len();
+            } else {
+                matched_all = false;
+                break;
+            }
+        }
+        if matched_all {
+            return Some((start, cursor));
+        }
+        let step = full_text
+            .get(start..)
+            .and_then(|s| s.chars().next())
+            .map_or(1, char::len_utf8);
+        search_from = start + step;
+    }
+    None
+}
+
+fn locate_utf8_byte_span(full_text: &str, excerpt: &str) -> Option<(usize, usize)> {
+    if full_text.is_empty() {
+        return None;
+    }
+    if !excerpt.is_empty() {
+        if let Some(start) = full_text.find(excerpt) {
+            return Some((start, start + excerpt.len()));
+        }
+    }
+    let trimmed = excerpt.trim();
+    if !trimmed.is_empty() && trimmed != excerpt {
+        if let Some(start) = full_text.find(trimmed) {
+            return Some((start, start + trimmed.len()));
+        }
+    }
+    let stripped = strip_edge_ellipsis(trimmed);
+    if !stripped.is_empty() {
+        if stripped != trimmed {
+            if let Some(start) = full_text.find(stripped) {
+                return Some((start, start + stripped.len()));
+            }
+        }
+        if let Some(span) = find_span_ws_flexible(full_text, stripped) {
+            return Some(span);
+        }
+    }
+
+    // Ellipsis-joined or multi-line non-contiguous excerpts: pick the longest contiguous
+    // matching chunk (>= 12 UTF-8 bytes), breaking ties in favor of earlier chunks.
+    let mut best_span: Option<(usize, usize)> = None;
+    let mut best_len = 0usize;
+    for line in trimmed.split(['\n', '\r']) {
+        for piece in line.split("...").flat_map(|seg| seg.split('…')) {
+            let chunk = piece.trim();
+            if chunk.len() < XERJ_URI_MIN_CHUNK_BYTES {
+                continue;
+            }
+            let matched = full_text
+                .find(chunk)
+                .map(|s| (s, s + chunk.len()))
+                .or_else(|| find_span_ws_flexible(full_text, chunk));
+            if let Some((s, e)) = matched {
+                let span_len = e.saturating_sub(s);
+                if span_len >= XERJ_URI_MIN_CHUNK_BYTES && span_len > best_len {
+                    best_len = span_len;
+                    best_span = Some((s, e));
+                }
+            }
+        }
+    }
+    if best_span.is_some() {
+        return best_span;
+    }
+
+    // Deterministic bounded prefix fallback snapped to a valid UTF-8 char boundary so
+    // downstream `claimcite` `verify_xerj_span` always verifies the span byte-for-byte.
+    let end = floor_char_boundary(full_text, full_text.len().min(XERJ_URI_FALLBACK_BYTES));
+    (end > 0).then_some((0, end))
+}
+
+fn format_xerj_uri(
+    index: &str,
+    doc_id: &str,
+    field: Option<&str>,
+    byte_start: usize,
+    byte_end: Option<usize>,
+) -> Option<String> {
+    if !is_valid_xerj_index(index) || !is_valid_xerj_doc_id(doc_id) {
+        return None;
+    }
+    if let Some(end) = byte_end {
+        if end < byte_start {
+            return None;
+        }
+    }
+    let field_suffix = match field {
+        Some(f) if !f.is_empty() => {
+            if !is_valid_xerj_field(f) {
+                return None;
+            }
+            format!("&f={}", percent_encode_rfc3986(f))
+        }
+        _ => String::new(),
+    };
+    let enc_index = percent_encode_rfc3986(index);
+    let enc_doc_id = percent_encode_rfc3986(doc_id);
+    Some(match byte_end {
+        Some(end) => format!("xerj://{enc_index}/{enc_doc_id}#b={byte_start}-{end}{field_suffix}"),
+        None => format!("xerj://{enc_index}/{enc_doc_id}#b={byte_start}{field_suffix}"),
+    })
+}
+
+/// Build a canonical, host-free `xerj://` evidence URI aligned byte-for-byte with
+/// `claimcite`:
+/// `xerj://<percent_encoded_index>/<percent_encoded_doc_id>#b=<byte_start>-<byte_end>&f=<field>`
+pub(crate) fn build_xerj_evidence_uri(
+    index: &str,
+    doc_id: &str,
+    field: &str,
+    full_text: &str,
+    excerpt: &str,
+) -> Option<String> {
+    if !is_valid_xerj_index(index) || !is_valid_xerj_doc_id(doc_id) {
+        return None;
+    }
+    let opt_field = if field.is_empty() {
+        None
+    } else {
+        if !is_valid_xerj_field(field) {
+            return None;
+        }
+        Some(field)
+    };
+    let (byte_start, byte_end) = locate_utf8_byte_span(full_text, excerpt)?;
+    format_xerj_uri(index, doc_id, opt_field, byte_start, Some(byte_end))
+}
+
+fn resolve_source_text<'a>(
+    src: &'a Value,
+    preferred_field: Option<&'a str>,
+) -> Option<(&'a str, &'a str)> {
+    if let Some(pf) = preferred_field {
+        if let Some(s) = src
+            .get(pf)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return Some((pf, s));
+        }
+    }
+    for cand in ["body", "text", "content", "code"] {
+        if let Some(s) = src
+            .get(cand)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return Some((cand, s));
+        }
+    }
+    if let Some(s) = src
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(("title", s));
+    }
+    None
+}
+
 fn clean_snippet(raw: &str, max_chars: usize) -> String {
     let mut compact = String::with_capacity(raw.len().min(max_chars + 16));
     let mut prev_ws = true;
@@ -685,6 +1012,11 @@ fn normalize_hits(raw_resp: &Value, cfg: &KbConfig, max_chars: usize) -> Vec<Sea
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        let doc_id = item
+            .get("_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let src = item.get("_source").unwrap_or(&Value::Null);
         let fallback_title = match src.get("title") {
             Some(Value::String(s)) => s.clone(),
@@ -695,10 +1027,71 @@ fn normalize_hits(raw_resp: &Value, cfg: &KbConfig, max_chars: usize) -> Vec<Sea
                 .join(" "),
             _ => String::new(),
         };
-        let passage = item
-            .pointer("/fields/_passage/0")
+        let passage_val = item.pointer("/fields/_passage/0");
+        let passage_field = passage_val
+            .and_then(|v| v.get("field"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        let passage_start = passage_val
+            .and_then(|v| v.get("start_offset"))
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok());
+        let passage_end = passage_val
+            .and_then(|v| v.get("end_offset"))
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok());
+        let passage_text = passage_val
             .and_then(|v| v.as_str().or_else(|| v.get("text").and_then(Value::as_str)))
+            .filter(|s| !s.is_empty());
+
+        let source_text = resolve_source_text(src, passage_field);
+        let raw_excerpt = passage_text
+            .or_else(|| source_text.map(|(_, s)| s))
             .unwrap_or(&fallback_title);
+        let snippet = clean_snippet(raw_excerpt, max_chars);
+
+        let cite = if let Some((resolved_field, full_text)) = source_text {
+            // Prefer XERJ's verified `_passage` byte offsets when they match `full_text`
+            // verbatim on the same field (this also disambiguates duplicate substrings).
+            let verified_passage_span = match (passage_start, passage_end, passage_text) {
+                (Some(so), Some(eo), Some(pt))
+                    if passage_field.is_none_or(|pf| pf == resolved_field)
+                        && so < eo
+                        && full_text.get(so..eo) == Some(pt) =>
+                {
+                    Some((so, eo))
+                }
+                _ => None,
+            };
+            if let Some((so, eo)) = verified_passage_span {
+                format_xerj_uri(&idx_name, &doc_id, Some(resolved_field), so, Some(eo))
+            } else {
+                let excerpt_for_uri = if passage_text.is_some() {
+                    raw_excerpt
+                } else {
+                    snippet.as_str()
+                };
+                build_xerj_evidence_uri(
+                    &idx_name,
+                    &doc_id,
+                    resolved_field,
+                    full_text,
+                    excerpt_for_uri,
+                )
+            }
+        } else {
+            // Fallback when `_source` text fields were not returned but XERJ `_passage`
+            // supplied byte offsets matching the returned UTF-8 passage slice length.
+            match (passage_start, passage_end, passage_text) {
+                (Some(so), Some(eo), Some(pt)) if so < eo && eo.saturating_sub(so) == pt.len() => {
+                    format_xerj_uri(&idx_name, &doc_id, passage_field, so, Some(eo))
+                }
+                (Some(so), None, Some(_)) => {
+                    format_xerj_uri(&idx_name, &doc_id, passage_field, so, None)
+                }
+                _ => None,
+            }
+        };
 
         let start = src
             .get("start_line")
@@ -766,6 +1159,8 @@ fn normalize_hits(raw_resp: &Value, cfg: &KbConfig, max_chars: usize) -> Vec<Sea
 
         out.push(SearchHit {
             index: idx_name,
+            doc_id,
+            cite,
             target_key,
             target_name,
             group,
@@ -777,7 +1172,7 @@ fn normalize_hits(raw_resp: &Value, cfg: &KbConfig, max_chars: usize) -> Vec<Sea
             page,
             pdf_pages_total,
             score,
-            snippet: clean_snippet(passage, max_chars),
+            snippet,
         });
     }
     out
@@ -1029,6 +1424,9 @@ pub(crate) fn format_search_text(resp: &SearchResponse) -> String {
             h.score
         ));
         lines.push(format!("   path: {loc}"));
+        if let Some(ref cite) = h.cite {
+            lines.push(format!("   cite: {cite}"));
+        }
         lines.push(format!("   snippet: {}", h.snippet));
     }
     lines.join("\n")
@@ -1224,5 +1622,296 @@ group = "notes"
         )
         .unwrap_err();
         assert!(err.contains("safety limit"));
+    }
+
+    #[test]
+    fn build_xerj_evidence_uri_emits_exact_utf8_byte_spans_and_percent_encodes() {
+        let full_text = "# Rust 能力武器库（活台账）\n\n- 核心原则：优先复用已验证原语。\n- 第二行：避免重复造轮子。";
+        let excerpt = "核心原则：优先复用已验证原语。";
+        let uri = build_xerj_evidence_uri(
+            "aikb-docs",
+            "doc/2026#1?v=2 空间",
+            "body",
+            full_text,
+            excerpt,
+        )
+        .unwrap();
+
+        let expected_start = full_text.find(excerpt).unwrap();
+        let expected_end = expected_start + excerpt.len();
+        assert_eq!(
+            uri,
+            format!(
+                "xerj://aikb-docs/doc%2F2026%231%3Fv%3D2%20%E7%A9%BA%E9%97%B4#b={expected_start}-{expected_end}&f=body"
+            )
+        );
+        // Byte-for-byte UTF-8 verification matching `claimcite`'s `verify_xerj_span`.
+        let sliced = std::str::from_utf8(
+            full_text
+                .as_bytes()
+                .get(expected_start..expected_end)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sliced, excerpt);
+
+        // Whitespace-collapsed snippet with trailing ellipsis maps back to exact multi-line bytes.
+        let collapsed = "# Rust 能力武器库（活台账） - 核心原则：优先复用已验证原语。…";
+        let uri2 =
+            build_xerj_evidence_uri("aikb-docs", "id1", "body", full_text, collapsed).unwrap();
+        let end2 = full_text.find(excerpt).unwrap() + excerpt.len();
+        assert_eq!(uri2, format!("xerj://aikb-docs/id1#b=0-{end2}&f=body"));
+
+        // Ellipsis-joined non-contiguous snippet selects the longest matching chunk (>= 12 bytes).
+        let joined = "短词 ... 优先复用已验证原语。 ... 另一段未命中文本";
+        let uri3 = build_xerj_evidence_uri("aikb-docs", "id2", "text", full_text, joined).unwrap();
+        let c_start = full_text.find("优先复用已验证原语。").unwrap();
+        let c_end = c_start + "优先复用已验证原语。".len();
+        assert_eq!(
+            uri3,
+            format!("xerj://aikb-docs/id2#b={c_start}-{c_end}&f=text")
+        );
+
+        // Empty or unmatched excerpt falls back to [0, <=240] snapped cleanly to a UTF-8 boundary.
+        let boundary_text = format!("{}中文边界测试", "a".repeat(239));
+        let uri4 = build_xerj_evidence_uri(
+            "aikb-docs",
+            "id3",
+            "body",
+            &boundary_text,
+            "totally missing",
+        )
+        .unwrap();
+        // Byte 240 falls inside the 3-byte '中' (239..242), so floor_char_boundary snaps to 239.
+        assert_eq!(uri4, "xerj://aikb-docs/id3#b=0-239&f=body");
+        assert!(boundary_text.is_char_boundary(239));
+
+        // Empty field omits `&f=`, allowing `claimcite` default field probing.
+        let uri_no_field =
+            build_xerj_evidence_uri("aikb-docs", "id4", "", full_text, excerpt).unwrap();
+        assert_eq!(
+            uri_no_field,
+            format!("xerj://aikb-docs/id4#b={expected_start}-{expected_end}")
+        );
+    }
+
+    #[test]
+    fn build_xerj_evidence_uri_rejects_invalid_indices_doc_ids_fields_and_host_port() {
+        let valid_text = "Sample document body text.";
+        for bad_index in [
+            "",
+            "_all",
+            "_security",
+            "a/b",
+            "a\\b",
+            "a..b",
+            "aikb-*",
+            "aikb?",
+            "aikb#frag",
+            "127.0.0.1:9200",
+            "aikb docs",
+            "aikb\ndocs",
+            "aikb\0docs",
+        ] {
+            assert!(
+                build_xerj_evidence_uri(bad_index, "doc1", "body", valid_text, "Sample").is_none(),
+                "expected index '{bad_index:?}' to be rejected"
+            );
+        }
+
+        for bad_id in ["", "bad\nid", "bad\rid", "bad\0id", "bad\tid"] {
+            assert!(
+                build_xerj_evidence_uri("aikb-docs", bad_id, "body", valid_text, "Sample")
+                    .is_none(),
+                "expected doc_id '{bad_id:?}' to be rejected"
+            );
+        }
+
+        for bad_field in ["a&b", "a=b", "a b", "a#b", "../body", "body\n"] {
+            assert!(
+                build_xerj_evidence_uri("aikb-docs", "doc1", bad_field, valid_text, "Sample")
+                    .is_none(),
+                "expected field '{bad_field:?}' to be rejected"
+            );
+        }
+
+        assert!(build_xerj_evidence_uri("aikb-docs", "doc1", "body", "", "Sample").is_none());
+    }
+
+    #[test]
+    fn normalize_hits_emits_verified_cite_uris_and_formats_text() {
+        let cfg = test_config();
+        let body = "重复句子。中间填充内容。重复句子。结束。";
+        let second_start = body.rfind("重复句子。").unwrap();
+        let second_end = second_start + "重复句子。".len();
+        let raw = json!({
+            "hits": {
+                "hits": [
+                    {
+                        "_index": "kb-docs-v1",
+                        "_id": "abc123",
+                        "_score": 9.5,
+                        "_source": {
+                            "ax_path": "guide.md",
+                            "ax_format": "md",
+                            "title": "Guide",
+                            "body": body
+                        },
+                        "fields": {
+                            "_passage": [{
+                                "field": "body",
+                                "ordinal": 1,
+                                "start_offset": second_start,
+                                "end_offset": second_end,
+                                "text": "重复句子。"
+                            }]
+                        }
+                    },
+                    {
+                        "_index": "kb-docs-v1",
+                        "_id": "hybrid-hit/1",
+                        "_score": 7.2,
+                        "_source": {
+                            "ax_path": "hybrid.md",
+                            "ax_format": "md",
+                            "title": "Hybrid Doc",
+                            "text": "Hybrid retrieval excerpt without _passage field."
+                        }
+                    },
+                    {
+                        "_index": "_system-hidden",
+                        "_id": "sys1",
+                        "_score": 5.0,
+                        "_source": {
+                            "ax_path": "ok.md",
+                            "ax_format": "md",
+                            "title": "System",
+                            "body": "System index should never emit a xerj:// URI."
+                        }
+                    }
+                ]
+            }
+        });
+
+        let hits = normalize_hits(&raw, &cfg, 200);
+        assert_eq!(hits.len(), 3);
+        // Hit 0 preserves XERJ's verified second-occurrence offset (disambiguating duplicate text).
+        assert_eq!(
+            hits.first().and_then(|h| h.cite.as_deref()),
+            Some(format!("xerj://kb-docs-v1/abc123#b={second_start}-{second_end}&f=body").as_str())
+        );
+        // Hit 1 (hybrid-style, no `_passage`, `_source.text` field) percent-encodes doc_id and bounds exact span.
+        assert_eq!(
+            hits.get(1).and_then(|h| h.cite.as_deref()),
+            Some("xerj://kb-docs-v1/hybrid-hit%2F1#b=0-48&f=text")
+        );
+        assert_eq!(
+            hits.get(1).map(|h| h.snippet.as_str()),
+            Some("Hybrid retrieval excerpt without _passage field.")
+        );
+        // Hit 2 (`_`-prefixed system index) must NOT emit a `xerj://` handle.
+        assert_eq!(hits.get(2).and_then(|h| h.cite.as_deref()), None);
+
+        let rendered = format_search_text(&SearchResponse {
+            query: "重复".to_string(),
+            scope: "docs".to_string(),
+            group: "all".to_string(),
+            mode_used: "bm25".to_string(),
+            took_ms: 4,
+            total: 3,
+            fuzzy_used: false,
+            anchor_relaxed: false,
+            pinyin_corrections: Vec::new(),
+            hits,
+        });
+        assert!(rendered.contains(&format!(
+            "   cite: xerj://kb-docs-v1/abc123#b={second_start}-{second_end}&f=body"
+        )));
+        assert!(rendered.contains("   cite: xerj://kb-docs-v1/hybrid-hit%2F1#b=0-48&f=text"));
+        assert!(!rendered.contains("xerj://_system-hidden"));
+    }
+
+    #[test]
+    fn hybrid_query_keeps_hybrid_at_top_level_and_pushes_filters_into_every_leg() {
+        let cfg = test_config();
+        let info = analyze_query("Rust 能力武器库", &cfg);
+
+        for scope in ["docs", "code", "all"] {
+            let body = build_search_body("Rust 能力武器库", &info, 6, "hybrid", scope, true, false);
+
+            // Top-level query MUST be `hybrid`, NEVER wrapped under `bool.must` alongside `bool.filter`,
+            // and NEVER rely on `post_filter` (which XERJ ignores / breaks with `hybrid`).
+            assert!(
+                body.pointer("/query/hybrid/queries").is_some(),
+                "scope={scope}: expected top-level query.hybrid.queries"
+            );
+            assert!(
+                body.pointer("/query/bool").is_none(),
+                "scope={scope}: hybrid must not be wrapped inside outer query.bool"
+            );
+            assert!(
+                body.get("post_filter").is_none(),
+                "scope={scope}: hybrid must not use post_filter"
+            );
+            // XERJ rc.105 rejects `fields: ["_passage"]` on hybrid queries (HTTP 400).
+            assert!(
+                body.get("fields").is_none(),
+                "scope={scope}: hybrid must omit fields._passage"
+            );
+
+            // Both legs must carry the pushed-down `bak-` exclusion and scope `ax_format` filter.
+            let bool_leg = body.pointer("/query/hybrid/queries/0/query/bool").unwrap();
+            let sem_filter = body
+                .pointer("/query/hybrid/queries/1/query/semantic/filter/bool")
+                .unwrap();
+
+            assert_eq!(
+                bool_leg.pointer("/must_not/0/prefix/ax_format"),
+                Some(&json!("bak-"))
+            );
+            assert_eq!(
+                sem_filter.pointer("/must_not/0/prefix/ax_format"),
+                Some(&json!("bak-"))
+            );
+
+            match scope {
+                "docs" => {
+                    assert_eq!(
+                        bool_leg.pointer("/filter/0/terms/ax_format"),
+                        Some(&json!(DOC_FORMATS))
+                    );
+                    assert_eq!(
+                        sem_filter.pointer("/filter/0/terms/ax_format"),
+                        Some(&json!(DOC_FORMATS))
+                    );
+                }
+                "code" => {
+                    assert_eq!(
+                        bool_leg.pointer("/filter/0/terms/ax_format"),
+                        Some(&json!(CODE_FORMATS))
+                    );
+                    assert_eq!(
+                        sem_filter.pointer("/filter/0/terms/ax_format"),
+                        Some(&json!(CODE_FORMATS))
+                    );
+                }
+                _ => {
+                    assert!(bool_leg.get("filter").is_none());
+                    assert!(sem_filter.get("filter").is_none());
+                }
+            }
+        }
+
+        // Non-hybrid BM25 search retains `fields: ["_passage"]` and top-level `query.bool`.
+        let bm25_body = build_search_body("Rust 能力武器库", &info, 6, "bm25", "docs", true, false);
+        assert!(bm25_body.pointer("/query/bool").is_some());
+        assert_eq!(bm25_body.get("fields"), Some(&json!(["_passage"])));
+        let src_fields = bm25_body.get("_source").and_then(Value::as_array).unwrap();
+        for required in ["body", "text", "content", "code"] {
+            assert!(
+                src_fields.contains(&json!(required)),
+                "_source must request '{required}'"
+            );
+        }
     }
 }

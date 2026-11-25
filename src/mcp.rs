@@ -38,7 +38,7 @@ pub(crate) fn tools_manifest(cfg: &KbConfig) -> Value {
     let mut tools = vec![
         json!({
             "name": "kb_search",
-            "description": "Search across configured local knowledge bases and projects (strictly read-only, loopback-only, multilingual with automatic offline CJK homophone/clause enhancement). Default scope='docs' filters out test code and opt-in noisy groups.",
+            "description": "Search across configured local knowledge bases and projects (strictly read-only, loopback-only, multilingual with automatic offline CJK homophone/clause enhancement). Returns paths, line/page locators, canonical xerj:// evidence URIs (cite), and snippets. Default scope='docs' filters out test code and opt-in noisy groups.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -585,5 +585,106 @@ group = "notes"
         assert!(!nd_str.starts_with("Content-Length:"));
         let v3: Value = serde_json::from_str(nd_str.trim()).unwrap();
         assert_eq!(v3.get("id").and_then(Value::as_u64), Some(10));
+    }
+
+    #[test]
+    fn kb_search_mcp_emits_canonical_xerj_evidence_uri_over_loopback() {
+        use std::io::Read as _;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body_text = "# Rust Playbook\n\nZero unsafe and zero unwrap in production paths.";
+        let passage_start = body_text.find("Zero unsafe").unwrap();
+        let passage_end = body_text.len();
+        let mock_resp = json!({
+            "took": 2,
+            "hits": {
+                "total": { "value": 1, "relation": "eq" },
+                "hits": [{
+                    "_index": "kb-notes-docs",
+                    "_id": "doc-42",
+                    "_score": 12.345,
+                    "_source": {
+                        "ax_path": "rust.md",
+                        "ax_format": "md",
+                        "title": "Rust Playbook",
+                        "body": body_text
+                    },
+                    "fields": {
+                        "_passage": [{
+                            "field": "body",
+                            "ordinal": 0,
+                            "start_offset": passage_start,
+                            "end_offset": passage_end,
+                            "text": "Zero unsafe and zero unwrap in production paths."
+                        }]
+                    }
+                }]
+            }
+        })
+        .to_string();
+
+        let srv = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 4096];
+            drop(sock.read(&mut req_buf));
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{mock_resp}",
+                mock_resp.len()
+            );
+            sock.write_all(http.as_bytes()).unwrap();
+        });
+
+        let cfg = KbConfig::parse_toml(
+            &format!(
+                r#"
+[engine]
+url = "http://127.0.0.1:{port}"
+
+[[sources]]
+key = "notes"
+name = "Notes"
+path = "/tmp"
+prefix = "kb-notes"
+group = "notes"
+"#
+            ),
+            Path::new("test.toml"),
+        )
+        .unwrap();
+        let client = ReadOnlyHttpClient::new(cfg.endpoint.clone());
+
+        let resp = handle_jsonrpc_message(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "tools/call",
+                "params": {
+                    "name": "kb_search",
+                    "arguments": { "query": "Zero unsafe", "target": "notes" }
+                }
+            }),
+            &cfg,
+            &client,
+        )
+        .unwrap();
+        srv.join().unwrap();
+
+        assert_eq!(
+            resp.pointer("/result/isError").and_then(Value::as_bool),
+            Some(false)
+        );
+        let text = resp
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        let expected_cite =
+            format!("cite: xerj://kb-notes-docs/doc-42#b={passage_start}-{passage_end}&f=body");
+        assert!(text.contains(&expected_cite), "missing cite in:\n{text}");
+        assert!(text.contains("path: /tmp/rust.md"));
+        assert!(text.contains("snippet: Zero unsafe and zero unwrap in production paths."));
+        assert!(!text.contains("127.0.0.1"));
     }
 }
