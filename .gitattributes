@@ -1,2 +1,3 @@
 *.bin binary
+install.sh text eol=lf
 src/data/pinyin_syllables.txt text eol=lf

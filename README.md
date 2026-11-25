@@ -37,7 +37,11 @@ When pointing Claude Code, Cursor, Codex, or Antigravity at a machine holding **
 curl -fsSL https://xerj.org/get | sh
 xerj --insecure --detach
 
-# Build & install kbwall from source (Rust >= 1.88)
+# Option A: Install prebuilt ~1 MB binary (macOS & Linux, verifies SHA-256, no Rust needed)
+curl -fsSL https://raw.githubusercontent.com/wasabihu/kbwall/main/install.sh | sh
+# (Windows: download kbwall-x86_64-pc-windows-msvc.zip from GitHub Releases)
+
+# Option B: Build from source (Rust >= 1.88)
 cargo install --git https://github.com/wasabihu/kbwall
 ```
 

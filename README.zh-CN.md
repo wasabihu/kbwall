@@ -37,7 +37,11 @@
 curl -fsSL https://xerj.org/get | sh
 xerj --insecure --detach
 
-# 从源码编译安装 kbwall（Rust >= 1.88）
+# 方式 A（推荐）：一键安装 ~1 MB 预编译单二进制（macOS / Linux，自动校验 SHA-256，无需安装 Rust）
+curl -fsSL https://raw.githubusercontent.com/wasabihu/kbwall/main/install.sh | sh
+# （Windows 用户可直接到 GitHub Releases 下载 kbwall-x86_64-pc-windows-msvc.zip）
+
+# 方式 B：从源码编译安装（Rust >= 1.88）
 cargo install --git https://github.com/wasabihu/kbwall
 ```
 
